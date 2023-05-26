@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/NikitaSutulov/software-architecture-lab4/httptools"
@@ -28,6 +31,8 @@ var (
 		"server2:8080",
 		"server3:8080",
 	}
+	healthyServers = make([]bool, len(serversPool))
+	mu             sync.Mutex
 )
 
 func scheme() string {
@@ -84,22 +89,47 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
-func main() {
-	flag.Parse()
+func hash(s string) uint32 {
+	h := sha256.New()
+	h.Write([]byte(s))
+	return binary.BigEndian.Uint32(h.Sum(nil))
+}
 
-	// TODO: Використовуйте дані про стан сервреа, щоб підтримувати список тих серверів, яким можна відправляти ззапит.
-	for _, server := range serversPool {
+func updateHealthyServers() {
+	for i, server := range serversPool {
 		server := server
+		i := i
 		go func() {
 			for range time.Tick(10 * time.Second) {
-				log.Println(server, health(server))
+				mu.Lock()
+				healthyServers[i] = health(server)
+				mu.Unlock()
 			}
 		}()
 	}
+}
+
+func main() {
+	flag.Parse()
+
+	updateHealthyServers()
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Рееалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		mu.Lock()
+		defer mu.Unlock()
+
+		serverIndex := hash(r.URL.Path) % uint32(len(serversPool))
+
+		originalIndex := serverIndex
+		for !healthyServers[serverIndex] {
+			serverIndex = (serverIndex + 1) % uint32(len(serversPool))
+			if serverIndex == originalIndex {
+				http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+				return
+			}
+		}
+
+		forward(serversPool[serverIndex], rw, r)
 	}))
 
 	log.Println("Starting load balancer...")
