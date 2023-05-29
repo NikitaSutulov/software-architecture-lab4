@@ -109,27 +109,39 @@ func updateHealthyServers() {
 	}
 }
 
+func chooseServer(path string) string {
+	mu.Lock()
+	defer mu.Unlock()
+
+	serverIndex := hash(path) % uint32(len(serversPool))
+
+	originalIndex := serverIndex
+	for !healthyServers[serverIndex] {
+		serverIndex = (serverIndex + 1) % uint32(len(serversPool))
+		if serverIndex == originalIndex {
+			return ""
+		}
+	}
+
+	return serversPool[serverIndex]
+}
+
 func main() {
 	flag.Parse()
 
 	updateHealthyServers()
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		serverIndex := hash(r.URL.Path) % uint32(len(serversPool))
-
-		originalIndex := serverIndex
-		for !healthyServers[serverIndex] {
-			serverIndex = (serverIndex + 1) % uint32(len(serversPool))
-			if serverIndex == originalIndex {
-				http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
-				return
-			}
+		server := chooseServer(r.URL.Path)
+		if server == "" {
+			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+			return
 		}
 
-		forward(serversPool[serverIndex], rw, r)
+		err := forward(server, rw, r)
+		if err != nil {
+			log.Printf("Failed to forward request: %s", err)
+		}
 	}))
 
 	log.Println("Starting load balancer...")
