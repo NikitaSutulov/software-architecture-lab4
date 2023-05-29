@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
+      args:
+        BUILDPLATFORM: linux/amd64
     networks:
       - servers
     depends_on:
