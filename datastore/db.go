@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -49,6 +50,8 @@ type Db struct {
 	putDone          chan error
 	index            hashIndex
 	segments         []*Segment
+	fileMutex        sync.Mutex
+	indexMutex       sync.Mutex
 }
 
 type Segment struct {
@@ -77,7 +80,7 @@ func NewDb(dir string, segmentSize int64) (*Db, error) {
 		return nil, err
 	}
 
-	if err := db.recover(); err != nil && err != io.EOF {
+	if err := db.recoverAll(); err != nil && err != io.EOF {
 		return nil, err
 	}
 
@@ -95,6 +98,7 @@ func (db *Db) Close() error {
 func (db *Db) startIndexRoutine() {
 	go func() {
 		for op := range db.indexOps {
+			db.indexMutex.Lock()
 			if op.isWrite {
 				db.setKey(op.key, op.index)
 			} else {
@@ -105,6 +109,7 @@ func (db *Db) startIndexRoutine() {
 					db.keyPositions <- &KeyPosition{s, p}
 				}
 			}
+			db.indexMutex.Unlock()
 		}
 	}()
 }
@@ -113,16 +118,19 @@ func (db *Db) startPutRoutine() {
 	go func() {
 		for {
 			e := <-db.putOps
+			db.fileMutex.Lock()
 			length := e.GetLength()
 			stat, err := db.out.Stat()
 			if err != nil {
 				db.putDone <- err
+				db.fileMutex.Unlock()
 				continue
 			}
 			if stat.Size()+length > db.segmentSize {
 				err := db.createSegment()
 				if err != nil {
 					db.putDone <- err
+					db.fileMutex.Unlock()
 					continue
 				}
 			}
@@ -135,6 +143,7 @@ func (db *Db) startPutRoutine() {
 				}
 			}
 			db.putDone <- nil
+			db.fileMutex.Unlock()
 		}
 	}()
 }
@@ -142,15 +151,18 @@ func (db *Db) startPutRoutine() {
 func (db *Db) startDeleteRoutine() {
 	go func() {
 		for op := range db.deleteOps {
+			db.fileMutex.Lock()
 			s, p, err := db.getSegmentAndPos(op.key)
 			if err != nil {
 				op.resp <- err
+				db.fileMutex.Unlock()
 				continue
 			}
 			s.index[op.key] = p
 			db.out.Write([]byte(deleteMarker))
 			delete(s.index, op.key)
 			op.resp <- nil
+			db.fileMutex.Unlock()
 		}
 	}()
 }
@@ -234,11 +246,34 @@ func findKeyInSegments(segments []*Segment, key string) bool {
 	return false
 }
 
-func (db *Db) recover() error {
+func (db *Db) recoverAll() error {
+	for _, segment := range db.segments {
+		if err := db.recoverSegment(segment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *Db) recoverSegment(segment *Segment) error {
+	f, err := os.Open(segment.filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := db.recover(f); err != nil && err != io.EOF {
+		return err
+	}
+
+	return nil
+}
+
+func (db *Db) recover(f *os.File) error {
 	var err error
 	var buf [bufSize]byte
 
-	in := bufio.NewReaderSize(db.out, bufSize)
+	in := bufio.NewReaderSize(f, bufSize)
 	for err == nil {
 		var (
 			header, data []byte
