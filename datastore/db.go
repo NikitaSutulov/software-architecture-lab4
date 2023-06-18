@@ -26,9 +26,9 @@ type IndexOp struct {
 	index   int64
 }
 
-type DeleteOp struct {
-	key  string
-	resp chan error
+type PutOp struct {
+	entry Entry
+	resp  chan error
 }
 
 type KeyPosition struct {
@@ -45,8 +45,7 @@ type Db struct {
 	lastSegmentIndex int
 	indexOps         chan IndexOp
 	keyPositions     chan *KeyPosition
-	putOps           chan Entry
-	deleteOps        chan DeleteOp
+	putOps           chan PutOp
 	putDone          chan error
 	index            hashIndex
 	segments         []*Segment
@@ -71,9 +70,8 @@ func NewDb(dir string, segmentSize int64) (*Db, error) {
 		segmentSize:  segmentSize,
 		indexOps:     make(chan IndexOp),
 		keyPositions: make(chan *KeyPosition),
-		putOps:       make(chan Entry),
+		putOps:       make(chan PutOp),
 		putDone:      make(chan error),
-		deleteOps:    make(chan DeleteOp),
 	}
 
 	if err := db.createSegment(); err != nil {
@@ -84,7 +82,6 @@ func NewDb(dir string, segmentSize int64) (*Db, error) {
 		return nil, err
 	}
 
-	db.startDeleteRoutine()
 	db.startIndexRoutine()
 	db.startPutRoutine()
 
@@ -117,50 +114,31 @@ func (db *Db) startIndexRoutine() {
 func (db *Db) startPutRoutine() {
 	go func() {
 		for {
-			e := <-db.putOps
+			op := <-db.putOps
 			db.fileMutex.Lock()
-			length := e.GetLength()
+			length := op.entry.GetLength()
 			stat, err := db.out.Stat()
 			if err != nil {
-				db.putDone <- err
+				op.resp <- err
 				db.fileMutex.Unlock()
 				continue
 			}
 			if stat.Size()+length > db.segmentSize {
 				err := db.createSegment()
 				if err != nil {
-					db.putDone <- err
+					op.resp <- err
 					db.fileMutex.Unlock()
 					continue
 				}
 			}
-			n, err := db.out.Write(e.Encode())
+			n, err := db.out.Write(op.entry.Encode())
 			if err == nil {
 				db.indexOps <- IndexOp{
 					isWrite: true,
-					key:     e.key,
+					key:     op.entry.key,
 					index:   int64(n),
 				}
 			}
-			db.putDone <- nil
-			db.fileMutex.Unlock()
-		}
-	}()
-}
-
-func (db *Db) startDeleteRoutine() {
-	go func() {
-		for op := range db.deleteOps {
-			db.fileMutex.Lock()
-			s, p, err := db.getSegmentAndPos(op.key)
-			if err != nil {
-				op.resp <- err
-				db.fileMutex.Unlock()
-				continue
-			}
-			s.index[op.key] = p
-			db.out.Write([]byte(deleteMarker))
-			delete(s.index, op.key)
 			op.resp <- nil
 			db.fileMutex.Unlock()
 		}
@@ -344,24 +322,28 @@ func (db *Db) Get(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if value == deleteMarker {
+		return "", ErrNotFound
+	}
 	return value, nil
 }
 
 func (db *Db) Put(key, value string) error {
-	e := Entry{
-		key:   key,
-		value: value,
-	}
-	db.putOps <- e
-	return <-db.putDone
-}
-
-func (db *Db) Delete(key string) error {
 	resp := make(chan error)
-	db.deleteOps <- DeleteOp{key: key, resp: resp}
+	db.putOps <- PutOp{
+		entry: Entry{
+			key:   key,
+			value: value,
+		},
+		resp: resp,
+	}
 	err := <-resp
 	close(resp)
 	return err
+}
+
+func (db *Db) Delete(key string) error {
+	return db.Put(key, deleteMarker)
 }
 
 func (db *Db) getLastSegment() *Segment {
